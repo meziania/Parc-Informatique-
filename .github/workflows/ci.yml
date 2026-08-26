@@ -370,8 +370,9 @@ jobs:
       - name: Run Playwright tests
         if: ${{ !cancelled() }}
         run:  |
-          docker compose exec -T app bin/console config:set url_base http://localhost:8090 --env=e2e_testing
-          docker compose exec -T app npx playwright test --shard=${{ matrix.shardIndex }}/${{ matrix.shardTotal }}
+          docker compose exec -T -w /var/www/glpi -e CI=true app bin/console config:set url_base http://localhost:8090 --env=e2e_testing
+          docker compose exec -T -w /var/www/glpi -e CI=true app npx playwright test --shard=${{ matrix.shardIndex }}/${{ matrix.shardTotal }} --reporter=blob,dot
+          ls -la blob-report || true
       - name: Check for PHP errors
         if: ${{ !cancelled() }}
         run: |
@@ -389,9 +390,12 @@ jobs:
           name: blob-report-${{ matrix.shardIndex }}
           path: blob-report/
           retention-days: 1
+          if-no-files-found: warn
 
   playwright-merge-reports:
-    if: ${{ !cancelled() }}
+    # Do not merge on fork nightly runs: Playwright shards are skipped there,
+    # and merge-reports fails if all-blob-reports was never created.
+    if: ${{ !cancelled() && needs.playwright.result != 'skipped' }}
     needs: [playwright]
     permissions:
       contents: "read"
@@ -409,12 +413,21 @@ jobs:
         run: npm ci
       - name: "Download blob reports"
         uses: actions/download-artifact@v8
+        continue-on-error: true
         with:
           path: all-blob-reports
           pattern: blob-report-*
           merge-multiple: true
       - name: "Merge into HTML Report"
-        run: npx playwright merge-reports --reporter=html,playwright-ctrf-json-reporter ./all-blob-reports
+        run: |
+          mkdir -p all-blob-reports
+          if [ -z "$(find all-blob-reports -type f 2>/dev/null | head -1)" ]; then
+            echo "::warning::No Playwright blob reports to merge (directory empty or missing)."
+            mkdir -p playwright-report
+            printf '%s\n' '<!doctype html><title>No Playwright reports</title><p>No blob reports were uploaded by the Playwright shards.</p>' > playwright-report/index.html
+            exit 0
+          fi
+          npx playwright merge-reports --reporter=html,playwright-ctrf-json-reporter ./all-blob-reports
       - name: "Upload HTML report"
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v7
@@ -424,6 +437,7 @@ jobs:
           retention-days: 30
       - name: "Publish test summary results"
         if: ${{ !cancelled() }}
+        continue-on-error: true
         uses: ctrf-io/github-test-reporter@v1
         with:
           report-path: ctrf/ctrf-report.json
